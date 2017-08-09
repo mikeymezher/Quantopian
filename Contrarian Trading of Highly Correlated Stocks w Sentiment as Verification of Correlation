@@ -1,4 +1,6 @@
-
+"""
+This is a template algorithm on Quantopian for you to adapt and fill in.
+"""
 from quantopian.algorithm import attach_pipeline, pipeline_output
 from quantopian.pipeline import CustomFactor, Pipeline
 from quantopian.pipeline.data.builtin import USEquityPricing
@@ -9,7 +11,7 @@ from quantopian.pipeline.classifiers.morningstar import Sector
 import numpy as np
 from scipy import signal
 import itertools as itools
-from sklearn.preprocessing import maxabs_scale
+from sklearn.preprocessing import MinMaxScaler
 from sklearn.preprocessing import StandardScaler
 
 def initialize(context):
@@ -18,6 +20,9 @@ def initialize(context):
     """   
     # Create our dynamic stock selector.
     attach_pipeline(make_pipeline(), 'my_pipeline')
+    context.lookback=1170 #This is the number of minutes used during cross correlation of data.
+    
+    #TODO: lookback may be best adjusted daily, to account for long term change in ideal lookback time.
          
 def make_pipeline():
     """
@@ -66,22 +71,29 @@ def before_trading_start(context, data):
     # Note: As it stands, the securities in this list are from two different industries (defense and
     # consumer electronics). Although more computationally expensive then dividing them out into their 
     # two respective industries prior to cross correlating, leaving them in the same matrix/data set and 
-    # cross correlating them gives us a way to 'check' that the crosscorrelation is valid, since               securities within the same industry should typically cross correlate to a higher degree than             across industries. ***
+    # cross correlating them gives us a way to 'check' that the crosscorrelation is valid, since               securities within the same industry should typically cross correlate to a higher degree than across industries. ***
     context.security_list = context.output.index 
-     # Within each sector, calculate the mean (and max, since we may choose only to trade the maximally        correlated securities regardless of industry) crosscorrelation between all combinations of              stocks. 
+     # Within each sector, calculate the mean (and max, since we may choose only to trade the maximally        correlated securities regardless of industry) crosscorrelation between all combinations of stocks. 
     #This will only run every trading day to prevent computational expense. In that 
     #respect, performs identically to a pipeline add-on (but allows the use of "history") 
-    price_history = np.transpose(data.history(context.security_list, fields="price", bar_count=1170,                     frequency="1m"))
+    price_history = np.transpose(data.history(context.security_list, fields="price",                                         bar_count=context.lookback,frequency="1m"))
     price_history=price_history.as_matrix()
-    hCorrVals,maxSecs,timeDelays=crossCorr(context.security_list,price_history)
+    #This returns three arrays, containing a filtered set of maximally cross correlated securities            within the last time range (given by context.lookback), their associated (and filtered) time delays      corresponding to their maximum correlation, and the degree of their correlation in the given time        frame. Essentially, since tau has already been filtered for, the degree of their correlation should      be used as a confidence feature to make predictions off of, and tau should be used to determine when to make purchases/sales. 
+    
+    #The best securities to trade using this algorithm (each day) are listed in the below lists ***
+    hCorrVals,maxSecs,timeDelays=crossCorr(context.security_list,price_history,context)
     print(maxSecs)
     print(hCorrVals)
+    print(timeDelays)
+   
+#TODO: Compute cross correlation for 1/3(context.lookback) and 2/3(context.lookback) as additional confidence features. (Ie if the correlation was high in all 3 time segments (given that there is overlap), the correlation will continue to be high the next day. 
+#In the same respect, it may also be beneficial to store the last logged time frame correlation results, and use those as additional features 
+#The premise of both of these additional potential features is that extended time will likely end up being weighted in a classifier or regressor to a lesser degree than more recent time correlation values.
 
-
-def crossCorr(securities,history):
+def crossCorr(securities,history,context):
      highCorrVal=0 #Initialize some comparator values
      #Initialize empty lists to return.
-     highCorrVals=[0]
+     highCorrVals=[]
      highCorrArray=[]
      maxSecs=[]
      timeDelays=[]
@@ -91,34 +103,53 @@ def crossCorr(securities,history):
      for c in range(len(combinations)):
         #Normalize securities being corrrelated so that their correlation is scale independent
         #Scale will be between -1 and 1 normalized ** fix this ** (scaled) over the last 1170 minutes of          trading
+        
+        #Here we get the history of one stock (to cross correlated with the next)
         uN_secHist1=history[combinations[c][0]]
+        #We scale the price of the stock such that its mean price is 0.
         scaler = StandardScaler()
         scaler.fit(uN_secHist1)
         secHist1=scaler.transform(uN_secHist1)
-        print(max(secHist1))
-        print(min(secHist1))
-        secHist1=maxabs_scale(secHist1)
-        print(max(secHist1))
-        print(min(secHist1))
-        print(np.mean(secHist1))
+        #Then we scale its price further such that it's maximum value is 1 and its minimum is -1
+        #Note that at this point, its mean is no longer necessarily 0.
+        normScaler=MinMaxScaler(feature_range=(-1, 1))
+        normScaler.fit(secHist1)
+        secHist1=normScaler.transform(secHist1)
+        #Repeat this process for the security which we are correlating against
         uN_secHist2=history[combinations[c][1]]
         scaler.fit(uN_secHist2)
         secHist2=scaler.transform(uN_secHist2)
-        secHist2=maxabs_scale(secHist2)
-        print(np.mean(secHist2))
-        corrVals=signal.correlate(secHist1,secHist2,'same')
+        normScaler.fit(secHist2)
+        secHist2=normScaler.transform(secHist2)
+        
+        corrVals=np.correlate(secHist1,secHist2,'same')
+        #Finally, we normalize the cross correlation such that it has a min value of -1 and a max of 1
+        corrVals=corrVals/len(corrVals) 
         maxCorrVal=max(corrVals)
-        if maxCorrVal>=highCorrVal:
+        #If the index max is small, the second security is leading (the smaller, the more lead)
+        idxMax=np.argmax(corrVals) #Maximum correlation value index, will be used to calculate tau.
+        midPoint=context.lookback/2
+        #Tau (the lag) is calculated below. If tau is positive, the second security leads
+        #(The greater the magnitude, the more lag)
+        tau=midPoint-idxMax #Tau is given in units of minutes of lag
+        
+        #Filter also by tau range, can't trade stocks based on no delay correlation, and if delay is too          high, correlation is likely coincidental. 
+        if maxCorrVal>=highCorrVal and abs(tau)>0 and abs(tau)<15:
             #Note that these tuple pairs should be checked to ensure the stocks are from the same                    industry (if they aren't there's likely a higher chance the correlation is coincidental
             maxSecs.append((securities[combinations[c][0]],securities[combinations[c][1]]))
             highCorrVals.append(maxCorrVal) #Will need to get index of maximum correlation values (tau)
             highCorrArray.append(corrVals) #New vals added to end of list
-            highCorrVal=min(highCorrVals)
-            #Values with a lower degree of correlation are popped from the front of the list
+            timeDelays.append(tau)
+      
+            #Values with a loweest degree of correlation are popped from the front of the list
             if len(highCorrVals)>numTradeCombo:
-                maxSecs.pop(0)
-                highCorrVals.pop(0) 
-                highCorrArray.pop(0)
+                highCorrVal=min(highCorrVals)
+                idxMin=highCorrVals.index(min(highCorrVals)) 
+                maxSecs.pop(idxMin)
+                highCorrVals.pop(idxMin) 
+                highCorrArray.pop(idxMin)
+                timeDelays.pop(idxMin)
+                
      #Return a list of highly correlated securities (order matters here), a list of corresponding cross        correlation metrics and a list of corresponding time delays. 
     
      return highCorrVals,maxSecs,timeDelays
