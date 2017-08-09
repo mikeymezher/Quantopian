@@ -1,6 +1,3 @@
-"""
-This is a template algorithm on Quantopian for you to adapt and fill in.
-"""
 from quantopian.algorithm import attach_pipeline, pipeline_output
 from quantopian.pipeline import CustomFactor, Pipeline
 from quantopian.pipeline.data.builtin import USEquityPricing
@@ -20,8 +17,10 @@ def initialize(context):
     """   
     # Create our dynamic stock selector.
     attach_pipeline(make_pipeline(), 'my_pipeline')
+    context.minCorr=.3 #Minimum acceptable cross correlation value to make trades based on
     context.lookback=1170 #This is the number of minutes used during cross correlation of data.
-    
+    context.slope_lookback=10 #Number of minutes used when determining sudden price change. 
+    context.perChange = 1 #Percent change over length of context.slope_lookback that would indicate a sudden price change (This is the percent change that trades will be made on)
     #TODO: lookback may be best adjusted daily, to account for long term change in ideal lookback time.
          
 def make_pipeline():
@@ -82,9 +81,10 @@ def before_trading_start(context, data):
     
     #The best securities to trade using this algorithm (each day) are listed in the below lists ***
     hCorrVals,maxSecs,timeDelays=crossCorr(context.security_list,price_history,context)
-    print(maxSecs)
-    print(hCorrVals)
-    print(timeDelays)
+    #"Globalize" the returned information so that we can handle these commodities every minute. 
+    context.Securities=maxSecs
+    context.CorrVals=hCorrVals
+    context.timeDelays=timeDelays
    
 #TODO: Compute cross correlation for 1/3(context.lookback) and 2/3(context.lookback) as additional confidence features. (Ie if the correlation was high in all 3 time segments (given that there is overlap), the correlation will continue to be high the next day. 
 #In the same respect, it may also be beneficial to store the last logged time frame correlation results, and use those as additional features 
@@ -126,15 +126,15 @@ def crossCorr(securities,history,context):
         #Finally, we normalize the cross correlation such that it has a min value of -1 and a max of 1
         corrVals=corrVals/len(corrVals) 
         maxCorrVal=max(corrVals)
-        #If the index max is small, the second security is leading (the smaller, the more lead)
+        #If the index max is small, the first security is leading (the smaller, the more lead)
         idxMax=np.argmax(corrVals) #Maximum correlation value index, will be used to calculate tau.
         midPoint=context.lookback/2
-        #Tau (the lag) is calculated below. If tau is positive, the second security leads
+        #Tau (the lag) is calculated below. If tau is negative, the second security leads
         #(The greater the magnitude, the more lag)
         tau=midPoint-idxMax #Tau is given in units of minutes of lag
         
-        #Filter also by tau range, can't trade stocks based on no delay correlation, and if delay is too          high, correlation is likely coincidental. 
-        if maxCorrVal>=highCorrVal and abs(tau)>0 and abs(tau)<15:
+        #Filter also by tau range, can't trade stocks based on no delay correlation, and if delay is too          high, correlation is likely coincidental. Also, correlation must be above minimum acceptable correlation
+        if maxCorrVal>=highCorrVal and abs(tau)>0 and abs(tau)<15 and maxCorrVal>=context.minCorr:
             #Note that these tuple pairs should be checked to ensure the stocks are from the same                    industry (if they aren't there's likely a higher chance the correlation is coincidental
             maxSecs.append((securities[combinations[c][0]],securities[combinations[c][1]]))
             highCorrVals.append(maxCorrVal) #Will need to get index of maximum correlation values (tau)
@@ -165,13 +165,45 @@ def crossCorr(securities,history,context):
      #Will use numpy.correlate function. Look at conv function documentation. 'same' setting will likely      #work optimally, tau can be defined in that case as the index of the maximum value in the returned      #correlation array. *****    
     
     #NOTE: We could also return securities that are highly INVERSELY correlated, and make predictions       # off the inverse cross correlation 
+
+#This function is meant to detect abrupt changes in a securities spike (specifically the securities that have been selected to monitor based on the cross correlation values). 
+def spikeDetect(recentHist,context):
+    #First we need to define what a sudden change is. One such definition could be any period where the magnitude of the percent change of the last X (X here defined as context.slope_lookback) values is greater than a slope of Y.
+    #To determine this, this function simply calculates the percent change of the last X prices
+    #Calculating the mean percent change below: (given as normalized 0-1 value ie .1=10% change)
+    perChange=(recentHist[-1]-recentHist[0])/(recentHist[0]) 
+    return perChange
+    pass
+
+#This function is meant to monitor the spike and detect its total duration. Once it ends, it must flag that the spike has ended so that the security that was purchased on an upward sudden change can be sold. Ideally, this would be run in parallel in a seperate thread or process. 
+def monitorSpike():
+    pass
      
 def handle_data(context,data):
     """
     Called every minute.
     """
-     
-    
+    for idx in range(len(context.Securities)):
+        #For each pair of highly correlated values, get the last X minutes of price data (X defined as context.slope_lookback)
+        pH1=np.transpose(data.history(context.Securities[idx][0], fields="price",                                         bar_count=context.slope_lookback,frequency="1m"))
+        pH1=pH1.as_matrix() 
+        pH2=np.transpose(data.history(context.Securities[idx][1], fields="price",                                         bar_count=context.slope_lookback,frequency="1m"))
+        pH2=pH2.as_matrix()
+        #Get the tau (time shift) value for this pair of securities
+        #RECALL: Positive tau means first security leads, negative means second leads
+        tau=context.timeDelays[idx]
+        #We COULD detect spikes in BOTH the first and second securities, regardless of tau and then use them as an additional confidence feature (ie if the LAGGING security has an abrupt change in price detected prior to the LEADING security, then further diminish confidence that this pair is a good pair to make acute trades on) ******* 
+        if tau>0: 
+            spike=spikeDetect(pH1,context)
+        if tau<0:
+            spike=spikeDetect(pH2,context) 
+        print(spike)
+        
+        #This function will return a spike's direction (1 - bull, 0 - bear) of a given security as soon as the         function is run. If no sudden change is defined, the function will return 2. We are most interested in bullish sudden changes, as this algorithm will not aim at shorting any stocks. We may still use the detection of a bearish change, to ensure we've sold all correlating securities. 
+            
+            
+        
+      
     # Within each top crosscorrelated security, compute tau (lag factor). (Note that tau should be used       as an additional feature, if the lag is unreasonably long, dont trade, if it's less than 2 min or       so, that combination of stocks might also be difficult to trade on.)
     
     # Optional: Compare sentiment data between top cross correlated stocks, based on the hypothesis that     # highly correlated stocks will continue to be highly correlated if their sentiment is similar.
