@@ -1,0 +1,153 @@
+
+from quantopian.algorithm import attach_pipeline, pipeline_output
+from quantopian.pipeline import CustomFactor, Pipeline
+from quantopian.pipeline.data.builtin import USEquityPricing
+from quantopian.pipeline.factors import AverageDollarVolume
+from quantopian.pipeline.filters.morningstar import Q1500US
+from quantopian.pipeline.data import morningstar
+from quantopian.pipeline.classifiers.morningstar import Sector
+import numpy as np
+from scipy import signal
+import itertools as itools
+from sklearn.preprocessing import maxabs_scale
+from sklearn.preprocessing import StandardScaler
+
+def initialize(context):
+    """
+    Called once at the start of the algorithm.
+    """   
+    # Create our dynamic stock selector.
+    attach_pipeline(make_pipeline(), 'my_pipeline')
+         
+def make_pipeline():
+    """
+    A function to create our dynamic stock selector (pipeline). Documentation on
+    pipeline can be found here: https://www.quantopian.com/help#pipeline-title
+    """
+    
+    # Base universe set to the Q1500US
+    base_universe = Q1500US()
+    
+    #Get all industry codes
+    industry=morningstar.asset_classification.morningstar_industry_code.latest
+    #Get all sector codes
+    sector = Sector()
+    
+    # Create filters (to be used as masks) of different industries/sectors 
+    # This is the mask that should exclude the most stocks. 
+    # Note that these may need to be even further filtered to exclude securities outside of a 
+    # similar range of volumes/size. For instance, the defense sector stock provides stocks as large as     # LMT but also small defense companies. Although this shouldn't matter due to the second filter of 
+    # crosscorrelation, this may be unnecassary computational expense. 
+    
+    dFilt=sector.eq(310) #Indicates aerospace/defense sector
+    dFilt2=industry.eq(31052107) #Indicates aerospace/defense industry
+    tFilt=sector.eq(311) #Indicates consumer electronics sector
+    tFilt2=industry.eq(31167138) #Indicates consumer electronics industry 
+    defenseFilt= dFilt & dFilt2 #Combination of filters
+    techFilt= tFilt & tFilt2
+    
+    tradable=base_universe & (defenseFilt | techFilt)
+    
+    pipe = Pipeline(
+        screen = tradable,
+        columns = {
+            
+        }
+    )
+    return pipe
+ 
+def before_trading_start(context, data):
+    """
+    Called every day before market open.
+    """
+    context.output = pipeline_output('my_pipeline')
+  
+    # These are the securities that we are interested in trading each day.
+    # Note: As it stands, the securities in this list are from two different industries (defense and
+    # consumer electronics). Although more computationally expensive then dividing them out into their 
+    # two respective industries prior to cross correlating, leaving them in the same matrix/data set and 
+    # cross correlating them gives us a way to 'check' that the crosscorrelation is valid, since               securities within the same industry should typically cross correlate to a higher degree than             across industries. ***
+    context.security_list = context.output.index 
+     # Within each sector, calculate the mean (and max, since we may choose only to trade the maximally        correlated securities regardless of industry) crosscorrelation between all combinations of              stocks. 
+    #This will only run every trading day to prevent computational expense. In that 
+    #respect, performs identically to a pipeline add-on (but allows the use of "history") 
+    price_history = np.transpose(data.history(context.security_list, fields="price", bar_count=1170,                     frequency="1m"))
+    price_history=price_history.as_matrix()
+    hCorrVals,maxSecs,timeDelays=crossCorr(context.security_list,price_history)
+    print(maxSecs)
+    print(hCorrVals)
+
+
+def crossCorr(securities,history):
+     highCorrVal=0 #Initialize some comparator values
+     #Initialize empty lists to return.
+     highCorrVals=[0]
+     highCorrArray=[]
+     maxSecs=[]
+     timeDelays=[]
+     numTradeCombo=5 #Number of most correlated combinations we wish to keep. 
+     numSec=len(history) #Number of securities being evaluated
+     combinations=list(itools.combinations(range(numSec),2)) #All possible combinations of securities
+     for c in range(len(combinations)):
+        #Normalize securities being corrrelated so that their correlation is scale independent
+        #Scale will be between -1 and 1 normalized ** fix this ** (scaled) over the last 1170 minutes of          trading
+        uN_secHist1=history[combinations[c][0]]
+        scaler = StandardScaler()
+        scaler.fit(uN_secHist1)
+        secHist1=scaler.transform(uN_secHist1)
+        print(max(secHist1))
+        print(min(secHist1))
+        secHist1=maxabs_scale(secHist1)
+        print(max(secHist1))
+        print(min(secHist1))
+        print(np.mean(secHist1))
+        uN_secHist2=history[combinations[c][1]]
+        scaler.fit(uN_secHist2)
+        secHist2=scaler.transform(uN_secHist2)
+        secHist2=maxabs_scale(secHist2)
+        print(np.mean(secHist2))
+        corrVals=signal.correlate(secHist1,secHist2,'same')
+        maxCorrVal=max(corrVals)
+        if maxCorrVal>=highCorrVal:
+            #Note that these tuple pairs should be checked to ensure the stocks are from the same                    industry (if they aren't there's likely a higher chance the correlation is coincidental
+            maxSecs.append((securities[combinations[c][0]],securities[combinations[c][1]]))
+            highCorrVals.append(maxCorrVal) #Will need to get index of maximum correlation values (tau)
+            highCorrArray.append(corrVals) #New vals added to end of list
+            highCorrVal=min(highCorrVals)
+            #Values with a lower degree of correlation are popped from the front of the list
+            if len(highCorrVals)>numTradeCombo:
+                maxSecs.pop(0)
+                highCorrVals.pop(0) 
+                highCorrArray.pop(0)
+     #Return a list of highly correlated securities (order matters here), a list of corresponding cross        correlation metrics and a list of corresponding time delays. 
+    
+     return highCorrVals,maxSecs,timeDelays
+    
+    #TODO: Calculate tau for each tuple pair
+    #      Identify securities with a high correlation in multiple instances, especially if they have 
+    #      a leading "tau" (that is the maximum correlation time shift is negative with respect to their            correlary (their price change leads)
+    #      "Tau" should also be used as a check to ensure correlation will likely hold. Tau should be in            a given range (likely between 2-10 minutes... ***VALIDATE THIS ASSUMPTION***)
+    
+    #More cross correlation functions, correlating only significant spikes or drops in price, and            sentiment data
+                
+            
+     #Will use numpy.correlate function. Look at conv function documentation. 'same' setting will likely      #work optimally, tau can be defined in that case as the index of the maximum value in the returned      #correlation array. *****    
+    
+    #NOTE: We could also return securities that are highly INVERSELY correlated, and make predictions       # off the inverse cross correlation 
+     
+def handle_data(context,data):
+    """
+    Called every minute.
+    """
+     
+    
+    # Within each top crosscorrelated security, compute tau (lag factor). (Note that tau should be used       as an additional feature, if the lag is unreasonably long, dont trade, if it's less than 2 min or       so, that combination of stocks might also be difficult to trade on.)
+    
+    # Optional: Compare sentiment data between top cross correlated stocks, based on the hypothesis that     # highly correlated stocks will continue to be highly correlated if their sentiment is similar.
+    #1170 minutes is selected (3 full trading days) 
+   
+    pass
+
+
+    
+
