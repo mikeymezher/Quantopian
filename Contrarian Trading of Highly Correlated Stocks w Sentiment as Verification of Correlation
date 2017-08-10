@@ -20,9 +20,17 @@ def initialize(context):
     context.minCorr=.3 #Minimum acceptable cross correlation value to make trades based on
     context.lookback=1170 #This is the number of minutes used during cross correlation of data.
     context.slope_lookback=10 #Number of minutes used when determining sudden price change. 
-    context.perChange = 1 #Percent change over length of context.slope_lookback that would indicate a sudden price change (This is the percent change that trades will be made on)
+    context.perChange = .3 #Percent change over length of 1/3(context.slope_lookback) that would indicate a sudden price change (This is the percent change that trades will be made on)
+    context.numTradeCombo=5 #Number of most correlated combinations we wish to keep.
     #TODO: lookback may be best adjusted daily, to account for long term change in ideal lookback time.
-         
+    context.timerList=[] #List of times of when to make a trade (unit in minutes from present)
+    context.tradeList=[] #List of securities to trade 
+    context.actionList=[] #List of actions (buy = 1  default (no action) = 0 sell = -1)
+    context.tradingNow=[] #List of whether or not a security pair is currently trading (abrupt change already detected (yes = 1 or no = 0)
+    
+    #Sell all securities at the end of each trading day (5 minutes before close of market)
+    schedule_function(sellAll, date_rules.every_day(), time_rules.market_close(minutes=5))
+    set_commission(commission.PerShare(cost=0.0, min_trade_cost=0.0))     
 def make_pipeline():
     """
     A function to create our dynamic stock selector (pipeline). Documentation on
@@ -50,7 +58,7 @@ def make_pipeline():
     defenseFilt= dFilt & dFilt2 #Combination of filters
     techFilt= tFilt & tFilt2
     
-    tradable=base_universe & (defenseFilt | techFilt)
+    tradable=base_universe #& (defenseFilt | techFilt)
     
     pipe = Pipeline(
         screen = tradable,
@@ -85,6 +93,9 @@ def before_trading_start(context, data):
     context.Securities=maxSecs
     context.CorrVals=hCorrVals
     context.timeDelays=timeDelays
+    context.actionList,context.timerList,context.tradeList,context.tradingNow=[0]*len(context.Securities),[0]*len(context.Securities),[0]*len(context.Securities),[0]*len(context.Securities) #list of zeros indicating that no stocks should currently be trading
+    #(Note that all stocks should be sold at end of every tradinng day.) 
+  
    
 #TODO: Compute cross correlation for 1/3(context.lookback) and 2/3(context.lookback) as additional confidence features. (Ie if the correlation was high in all 3 time segments (given that there is overlap), the correlation will continue to be high the next day. 
 #In the same respect, it may also be beneficial to store the last logged time frame correlation results, and use those as additional features 
@@ -96,8 +107,7 @@ def crossCorr(securities,history,context):
      highCorrVals=[]
      highCorrArray=[]
      maxSecs=[]
-     timeDelays=[]
-     numTradeCombo=5 #Number of most correlated combinations we wish to keep. 
+     timeDelays=[] 
      numSec=len(history) #Number of securities being evaluated
      combinations=list(itools.combinations(range(numSec),2)) #All possible combinations of securities
      for c in range(len(combinations)):
@@ -142,7 +152,7 @@ def crossCorr(securities,history,context):
             timeDelays.append(tau)
       
             #Values with a loweest degree of correlation are popped from the front of the list
-            if len(highCorrVals)>numTradeCombo:
+            if len(highCorrVals)>context.numTradeCombo:
                 highCorrVal=min(highCorrVals)
                 idxMin=highCorrVals.index(min(highCorrVals)) 
                 maxSecs.pop(idxMin)
@@ -166,17 +176,47 @@ def crossCorr(securities,history,context):
     
     #NOTE: We could also return securities that are highly INVERSELY correlated, and make predictions       # off the inverse cross correlation 
 
+    
+def sellAll(context,data):
+    for pos in context.portfolio.positions:
+        order_target_percent(pos,0.0)
+        print('End of day, sold: ' + str(pos))
+    
+            
+    
 #This function is meant to detect abrupt changes in a securities spike (specifically the securities that have been selected to monitor based on the cross correlation values). 
-def spikeDetect(recentHist,context):
+def spikeDetect(recentHist):
     #First we need to define what a sudden change is. One such definition could be any period where the magnitude of the percent change of the last X (X here defined as context.slope_lookback) values is greater than a slope of Y.
     #To determine this, this function simply calculates the percent change of the last X prices
     #Calculating the mean percent change below: (given as normalized 0-1 value ie .1=10% change)
-    perChange=(recentHist[-1]-recentHist[0])/(recentHist[0]) 
-    return perChange
+    erRange=len(recentHist)//3 
+    midRange=erRange*2
+    endRange=erRange*3
+    #Er_perChange ("early percent change") is the percent change of the most recent third of the stock price. Mid_perChange ("Middle percent change") is the percent change of the middle third (second of three time "windows") of the stock price. And Base_perChange is the percent change of the last third. 
+    #Obviously, the tot_perChange is representative of the percent change over the entire given time window
+    
+    #Ie: The sum of Er Mid and Base perChange should be equal to tot_perChange**********
+    Er_perChange=(recentHist[-1]-recentHist[-(erRange+1)])/(recentHist[-(erRange+1)])
+    Mid_perChange=(recentHist[-(erRange+1)]-recentHist[-(midRange+1)])/(recentHist[-(midRange+1)])
+    Base_perChange=(recentHist[-(midRange+1)]-recentHist[-(endRange+1)])/(recentHist[-(endRange+1)])
+    tot_perChange=(recentHist[-1]-recentHist[0])/(recentHist[0]) 
+    return Er_perChange,Mid_perChange,Base_perChange,tot_perChange
     pass
 
-#This function is meant to monitor the spike and detect its total duration. Once it ends, it must flag that the spike has ended so that the security that was purchased on an upward sudden change can be sold. Ideally, this would be run in parallel in a seperate thread or process. 
-def monitorSpike():
+#Once the timer has come to 0 (assumed lag time has been met) make a trade - ie buy or sell the security
+#Note, that trades are always made on the LAGGING securities. 
+def makeTrade(data,context,idx):
+    if data.can_trade(context.tradeList[idx]):
+        #Sell all of the indicated security
+        if context.actionList[idx]==-1 and context.tradeList[idx] in context.portfolio.positions:
+            order_target_percent(context.tradeList[idx],0.0)
+            print('Sold ' + str(context.tradeList[idx]))
+            
+        #Buy a portion of the security proportional to the security's presence in the security list (the percent of portfolio in this increase every time this security is purchased (in contrast to order_target_percent)
+        if context.actionList[idx]==1:
+            order_percent(context.tradeList[idx],float(1/(2*float(context.numTradeCombo))))
+            print('Purchased ' + str(context.tradeList[idx]))
+            
     pass
      
 def handle_data(context,data):
@@ -194,10 +234,48 @@ def handle_data(context,data):
         tau=context.timeDelays[idx]
         #We COULD detect spikes in BOTH the first and second securities, regardless of tau and then use them as an additional confidence feature (ie if the LAGGING security has an abrupt change in price detected prior to the LEADING security, then further diminish confidence that this pair is a good pair to make acute trades on) ******* 
         if tau>0: 
-            spike=spikeDetect(pH1,context)
+            lead=pH1
+            lag=1
         if tau<0:
-            spike=spikeDetect(pH2,context) 
-        print(spike)
+            lead=pH2
+            lag=0
+            
+        erSpike,midSpike,baseSpike,totSpike=spikeDetect(lead)
+        if erSpike>(context.perChange/100):
+                #Trade correlated stock in tau minutes. Mark that this security pair has been identified as tradable    
+             if context.tradingNow[idx]==0:
+                    context.timerList[idx]=abs(tau)
+                    context.tradeList[idx]=context.Securities[idx][lag]
+                    context.actionList[idx]=1 
+                    context.tradingNow[idx]=1
+                    
+        if erSpike<0 and context.tradingNow[idx]==1: #If the spike ends, we need to sell the security 
+            context.timerList[idx]=abs(tau)
+            context.tradeList[idx]=context.Securities[idx][lag]
+            context.actionList[idx]=-1
+            
+            
+        if context.tradingNow[idx]==1:
+                context.timerList[idx]=context.timerList[idx]-1 #Subtract 1 from the trade countdown timer
+                #If the timer is -1, it is time to make the trade. 
+                if context.timerList[idx]==-1:
+                    print('Making a trade')
+                    makeTrade(data,context,idx) #Calling this function makes the a trade (buy or sell) Note that this function also resets the actionList of any given index (sets it to default value 0 after making a buy (1) or sell (-1)
+                    if context.actionList[idx]==-1:
+                    	context.tradingNow[idx]=0 
+                        print('reset trading now')
+                        #Reset the stock's trading status only once the stock has been sold
+                	context.actionList[idx]=0
+                    context.timerList[idx]=0
+        
+            
+                
+                
+            
+        #Note that these spikes could be used as features into a learning algo to determine whether or not to make a trade. 
+        
+        #For now, to prevent the need to train an algo, we'll trade on the premise that if the erspike exceeds some constant threshold then trade the related security in tau minutes. Furthermore, if the er spike is less than the mid spike/base spike, then we know the slope of the spike we are trading is starting to deminish so we should sell in tau minutes. 
+        
         
         #This function will return a spike's direction (1 - bull, 0 - bear) of a given security as soon as the         function is run. If no sudden change is defined, the function will return 2. We are most interested in bullish sudden changes, as this algorithm will not aim at shorting any stocks. We may still use the detection of a bearish change, to ensure we've sold all correlating securities. 
             
