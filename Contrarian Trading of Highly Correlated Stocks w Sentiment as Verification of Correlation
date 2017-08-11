@@ -17,10 +17,10 @@ def initialize(context):
     """   
     # Create our dynamic stock selector.
     attach_pipeline(make_pipeline(), 'my_pipeline')
-    context.minCorr=.2 #Minimum acceptable cross correlation value to make trades based on
-    context.lookback=1000 #This is the number of minutes used during cross correlation of data.
-    context.slope_lookback=20 #Number of minutes used when determining sudden price change. 
-    context.perChange = .2 #Percent change over length of 1/3(context.slope_lookback) that would indicate a sudden price change (This is the percent change that trades will be made on)
+    context.minCorr=.35 #Minimum acceptable cross correlation value to make trades based on
+    context.lookback=185 #This is the number of minutes used during cross correlation of data. Note, that this should be less than 370 (390 trading day minutes - 20 min end of day stop) since we correlate same day data then trade based on those correlation. (Correlate first half the day, trade second half) 
+    context.slope_lookback=15 #Number of minutes used when determining sudden price change. 
+    context.perChange = .15 #Percent change over length of 1/3(context.slope_lookback) that would indicate a sudden price change (This is the percent change that trades will be made on)
     context.numTradeCombo=5 #Number of most correlated combinations we wish to keep.
     #TODO: lookback may be best adjusted daily, to account for long term change in ideal lookback time.
     context.timerList=[] #List of times of when to make a trade (unit in minutes from present)
@@ -30,12 +30,19 @@ def initialize(context):
     context.tempCash=0
     
     #Sell all securities at the end of each trading day (5 minutes before close of market)
-    schedule_function(sellAll, date_rules.every_day(), time_rules.market_close(minutes=20))
+    schedule_function(sellAll, date_rules.every_day(), time_rules.market_close(minutes=15))
     #Coordinate trades every minute. in the given range (minTime). Note that half days will not be traded and that the end of the range is 370 minutes after market open (369 - ie 21 minutes prior to market close)
-    for minTime in range(1,370,1):
-    	schedule_function(coordTrade, date_rules.every_day(), time_rules.market_open(minutes = minTime), half_days=False)
     
+    
+    startTrade=context.lookback+2
+    endTrade=370
+    
+    for minTime in range(startTrade,endTrade,1):
+    	schedule_function(coordTrade, date_rules.every_day(), time_rules.market_open(minutes = minTime), half_days=False)
+    schedule_function(getIdealSec, date_rules.every_day(), time_rules.market_open(minutes = context.lookback))
     set_commission(commission.PerShare(cost=0.0, min_trade_cost=0.0))     
+                      
+                      
 def make_pipeline():
     """
     A function to create our dynamic stock selector (pipeline). Documentation on
@@ -78,7 +85,7 @@ def make_pipeline():
     )
     return pipe
  
-def before_trading_start(context, data):
+def getIdealSec(context, data): #This replaced before_trading_start(context, data)
     """
     Called every day before market open.
     """
