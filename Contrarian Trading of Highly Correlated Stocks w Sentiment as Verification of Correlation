@@ -3,6 +3,7 @@ from quantopian.pipeline import CustomFactor, Pipeline
 from quantopian.pipeline.data.builtin import USEquityPricing
 from quantopian.pipeline.factors import AverageDollarVolume
 from quantopian.pipeline.filters.morningstar import Q1500US
+from quantopian.pipeline.filters.morningstar import Q500US
 from quantopian.pipeline.data import morningstar
 from quantopian.pipeline.classifiers.morningstar import Sector
 import numpy as np
@@ -17,10 +18,10 @@ def initialize(context):
     """   
     # Create our dynamic stock selector.
     attach_pipeline(make_pipeline(), 'my_pipeline')
-    context.minCorr=.35 #Minimum acceptable cross correlation value to make trades based on
+    context.minCorr=.3 #Minimum acceptable cross correlation value to make trades based on
     context.lookback=185 #This is the number of minutes used during cross correlation of data. Note, that this should be less than 370 (390 trading day minutes - 20 min end of day stop) since we correlate same day data then trade based on those correlation. (Correlate first half the day, trade second half) 
     context.slope_lookback=15 #Number of minutes used when determining sudden price change. 
-    context.perChange = .15 #Percent change over length of 1/3(context.slope_lookback) that would indicate a sudden price change (This is the percent change that trades will be made on)
+    context.perChange = .1 #Percent change over length of 1/3(context.slope_lookback) that would indicate a sudden price change (This is the percent change that trades will be made on)
     context.numTradeCombo=5 #Number of most correlated combinations we wish to keep.
     #TODO: lookback may be best adjusted daily, to account for long term change in ideal lookback time.
     context.timerList=[] #List of times of when to make a trade (unit in minutes from present)
@@ -50,7 +51,7 @@ def make_pipeline():
     """
     
     # Base universe set to the Q1500US
-    base_universe = Q1500US()
+    base_universe = Q500US()
     
     #Get all industry codes
     industry=morningstar.asset_classification.morningstar_industry_code.latest
@@ -225,9 +226,18 @@ def spikeDetect(recentHist):
 def makeTrade(data,context,idx):
     openOrders=get_open_orders()
     if data.can_trade(context.tradeList[idx]):
+        print('Trade based on: ' + str(context.Securities[idx]) + ' ' + str(context.CorrVals[idx]) + ' ' + str(context.timeDelays[idx]))
+        print('Action list: ')
+        print(context.actionList) 
+        print('Active list: ')
+        print(context.tradingNow)
+        print('Index: ' + str(idx))
         #Sell all of the indicated security
         if context.actionList[idx]==-1 and context.tradeList[idx] in context.portfolio.positions:
             order_target_percent(context.tradeList[idx],0)
+            context.tradingNow[idx]=0 
+            context.actionList[idx]=0
+            context.timerList[idx]=None #Indicate sold
             print('Sold ' + str(context.tradeList[idx]))
             
         #Buy a portion of the security proportional to the security's presence in the security list (the percent of portfolio in this increase every time this security is purchased (in contrast to order_target_percent)
@@ -236,11 +246,13 @@ def makeTrade(data,context,idx):
         if (context.actionList[idx]==1 and (context.tempCash >(context.portfolio.portfolio_value*float(1/(2*float(context.numTradeCombo))))) and context.tradeList[idx] not in openOrders and (context.portfolio.portfolio_value>0) and (len(openOrders)==0)):         			
             order_value(context.tradeList[idx],context.portfolio.portfolio_value*float(1/(2*float(context.numTradeCombo))))
             #If purchase is not made for one of the above reasons (if conditionals), then indicate that this correlated couple is not trading. 
+            context.timerList[idx]=9999999 #Reset to high value to prevent repeat buying
             print('Purchased ' + str(context.tradeList[idx]))
             context.tempCash-=context.portfolio.portfolio_value*float(1/(2*float(context.numTradeCombo)))
         else:
-            context.tradingNow[idx]=0
+            #context.tradingNow[idx]=0
             print('Num open orders: ' + str(len(openOrders)))
+        
     pass
      
 def coordTrade(context,data):
@@ -249,6 +261,7 @@ def coordTrade(context,data):
     """
     context.tempCash=context.portfolio.cash
     for idx in range(len(context.Securities)):
+        erSpike,midSpike,baseSpike,totSpike=0,0,0,0
         #For each pair of highly correlated values, get the last X minutes of price data (X defined as context.slope_lookback)
         pH1=np.transpose(data.history(context.Securities[idx][0], fields="price",                                         bar_count=context.slope_lookback,frequency="1m"))
         pH1=pH1.as_matrix() 
@@ -266,15 +279,15 @@ def coordTrade(context,data):
             lag=0
             
         erSpike,midSpike,baseSpike,totSpike=spikeDetect(lead)
-        if erSpike>(context.perChange/100):
-                #Trade correlated stock in tau minutes. Mark that this security pair has been identified as tradable    
-             if context.tradingNow[idx]==0:
-                    context.timerList[idx]=abs(tau)
-                    context.tradeList[idx]=context.Securities[idx][lag]
-                    context.actionList[idx]=1 
-                    context.tradingNow[idx]=1
+        if erSpike>(context.perChange/100) and context.tradingNow[idx] == 0:
+                #Trade correlated stock in tau minutes. Mark that this security pair has been identified as tradable     
+            context.timerList[idx]=abs(tau)
+            context.tradeList[idx]=context.Securities[idx][lag]
+            context.actionList[idx]=1 
+            context.tradingNow[idx]=1
                     
-        if erSpike<0 and context.tradingNow[idx]==1: #If the spike ends, we need to sell the security 
+        if erSpike<0 and context.tradingNow[idx]==1 and tau!=None and context.actionList[idx] == 0: #If the spike ends, we need to sell the security 
+            print('Neg spike conditions met')
             context.timerList[idx]=abs(tau)
             context.tradeList[idx]=context.Securities[idx][lag]
             context.actionList[idx]=-1
@@ -285,13 +298,12 @@ def coordTrade(context,data):
                 #If the timer is -1, it is time to make the trade. 
                 if context.timerList[idx]<=-1:
                     makeTrade(data,context,idx) #Calling this function makes the a trade (buy or sell) Note that this function also resets the actionList of any given index (sets it to default value 0 after making a buy (1) or sell (-1)
-                    if context.actionList[idx]==-1:
-                    	context.tradingNow[idx]=0 
-                        #Reset the stock's trading status only once the stock has been sold
-                	context.actionList[idx]=0 #Note, that since we prevent the algorithm from buying additional stocks while there are open orders, having the action list reset to 0 here will prevent a backlogged spike train from ever trading.
+                    context.actionList[idx]=0 #Note, that since we prevent the algorithm from buying additional stocks while there are open orders, having the action list reset to 0 here will prevent a backlogged spike train from ever trading.
+                    	
+#Reset the stock's trading status only once the stock has been sold
+					
                     #Solution: Reset the tradingNow[idx] in cases where stocks were not purchased due to a backlog. 
-                    context.timerList[idx]=0
-        
+                     
             
         #Note that these spikes could be used as features into a learning algo to determine whether or not to make a trade. 
         
