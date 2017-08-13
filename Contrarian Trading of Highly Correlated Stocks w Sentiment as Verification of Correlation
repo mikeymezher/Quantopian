@@ -19,11 +19,11 @@ def initialize(context):
     """   
     # Create our dynamic stock selector.
     #Options as of now: tot(all), defense, tech, auto, chem
-    attach_pipeline(make_pipeline('auto'), 'my_pipeline')
+    attach_pipeline(make_pipeline('tot'), 'my_pipeline')
     
     
     context.minCorr=0.1 #Minimum acceptable cross correlation value to make trades based on
-    context.lookback=1000 #This is the number of minutes used during cross correlation of data. Note, that this should be less than 370 (390 trading day minutes - 20 min end of day stop) since we correlate same day data then trade based on those correlation. (Correlate first half the day, trade second half) 
+    context.lookback=180 #This is the number of minutes used during cross correlation of data. Note, that this should be less than 370 (390 trading day minutes - 20 min end of day stop) since we correlate same day data then trade based on those correlation. (Correlate first half the day, trade second half) 
     # *****^ Same day correlation may be the best way to figure out tau, but it may be suboptimal for selecting commonly correlated stocks. This selection is more likely to make errors in picking stocks which have a coincidentally high correlation (just for one particular day). 
  
 #Note, it may be ideal to select a tau based on the correlation method described below (just using the early half of the day) and to select likely correlated stocks seperately using a longer lookback time. ***
@@ -337,7 +337,7 @@ def makeTrade(data,context,idx):
         #Buy a portion of the security proportional to the security's presence in the security list (the percent of portfolio in this increase every time this security is purchased (in contrast to order_target_percent)
         print('temp cash ' + str(context.tempCash))
         print('value of purchase: ' + str(context.portfolio.portfolio_value*float(1/(2*float(context.numTradeCombo)))))
-        if (context.actionList[idx]==1 and (context.tempCash >(context.portfolio.portfolio_value*float(1/(2*float(context.numTradeCombo))))) and context.tradeList[idx] not in openOrders and (context.portfolio.portfolio_value>0) and (len(openOrders)==0)):         			
+        if (context.actionList[idx]==1 and (context.tempCash >(context.portfolio.portfolio_value*float(1/(2*float(context.numTradeCombo))))) and context.tradeList[idx] not in openOrders and (context.portfolio.portfolio_value>0)): #and (len(openOrders)==0)):         			
             order_value(context.tradeList[idx],context.portfolio.portfolio_value*float(1/(2*float(context.numTradeCombo))))
             #If purchase is not made for one of the above reasons (if conditionals), then indicate that this correlated couple is not trading. 
             context.timerList[idx]=9999999 #Reset to high value to prevent repeat buying
@@ -411,7 +411,7 @@ def coordTrade(context,data):
         if context.tradingNow[idx]==1:
                 context.timerList[idx]=context.timerList[idx]-1 #Subtract 1 from the trade countdown timer
                 #If the timer is -1, it is time to make the trade. 
-                if context.timerList[idx]<=-1:
+                if context.timerList[idx]<=-1 and context.actionList[idx]!=0:
                     makeTrade(data,context,idx) #Calling this function makes the a trade (buy or sell) Note that this function also resets the actionList of any given index (sets it to default value 0 after making a buy (1) or sell (-1)
                     context.actionList[idx]=0 #Note, that since we prevent the algorithm from buying additional stocks while there are open orders, having the action list reset to 0 here will prevent a backlogged spike train from ever trading.
                     	
