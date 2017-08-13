@@ -19,11 +19,11 @@ def initialize(context):
     """   
     # Create our dynamic stock selector.
     #Options as of now: tot(all), defense, tech, auto, chem
-    attach_pipeline(make_pipeline('tot'), 'my_pipeline')
+    attach_pipeline(make_pipeline('auto'), 'my_pipeline')
     
     
-    context.minCorr=0 #Minimum acceptable cross correlation value to make trades based on
-    context.lookback=1500 #This is the number of minutes used during cross correlation of data. Note, that this should be less than 370 (390 trading day minutes - 20 min end of day stop) since we correlate same day data then trade based on those correlation. (Correlate first half the day, trade second half) 
+    context.minCorr=0.1 #Minimum acceptable cross correlation value to make trades based on
+    context.lookback=1000 #This is the number of minutes used during cross correlation of data. Note, that this should be less than 370 (390 trading day minutes - 20 min end of day stop) since we correlate same day data then trade based on those correlation. (Correlate first half the day, trade second half) 
     # *****^ Same day correlation may be the best way to figure out tau, but it may be suboptimal for selecting commonly correlated stocks. This selection is more likely to make errors in picking stocks which have a coincidentally high correlation (just for one particular day). 
  
 #Note, it may be ideal to select a tau based on the correlation method described below (just using the early half of the day) and to select likely correlated stocks seperately using a longer lookback time. ***
@@ -161,14 +161,16 @@ def crossCorr(securities,history,context):
      timeDelays=[] 
      numSec=len(history) #Number of securities being evaluated
      combinations=list(itools.combinations(range(numSec),2)) #All possible combinations of securities
+
      for c in range(len(combinations)):
         negValIdxs=[]
          #Here we get the history of one stock (to cross correlated with the next)
         uN_secHist1=history[combinations[c][0]]
         #ADDED FUNCTIONALITY: Cubing of rectified time series to exagerate deviations prior to normalized correlation.
+       
         #1.) 0 the mean:
         histMean=np.mean(uN_secHist1)
-        uN_secHist1[:] = [x - histMean for x in uN_secHist1] #Subtract mean from all array vals
+        uN_secHist1=np.subtract(uN_secHist1,histMean) #Subtract mean from all vals in array
         #print('Zero centered')
         #2.) Note the location of all negative values
         for ii in range(len(uN_secHist1)):
@@ -179,16 +181,17 @@ def crossCorr(securities,history,context):
         uN_secHist1=abs(uN_secHist1)
         #print('Rectified')
         #4.) Exponate the signal (to exaggerate peaks and falls)
-        uN_secHist1=np.power(uN_secHist1,2) #Square each value
+        uN_secHist1=np.power(uN_secHist1,2) #Square each value 
         #print('Powered')
         #5.) Return values to being negative
         for negIdx in negValIdxs:
             uN_secHist1[negIdx]=uN_secHist1[negIdx]*-1
         #print('Unrectified')
         #Finally, proceed with the original correlation method. Repeat for second security as well. 
-            
+           
         #Normalize securities being corrrelated so that their correlation is scale independent
         #Scale will be between -1 and 1 normalized ** fix this ** (scaled) over the last X minutes of          trading
+        
         negValIdxs=[]
         #We scale the price of the stock such that its mean price is 0.
         scaler = StandardScaler()
@@ -205,7 +208,7 @@ def crossCorr(securities,history,context):
         uN_secHist2=history[combinations[c][1]]
         #1.) 0 the mean:
         histMean=np.mean(uN_secHist2)
-        uN_secHist2[:] = [x - histMean for x in uN_secHist2] #Subtract mean from all array vals
+        uN_secHist2=np.subtract(uN_secHist2,histMean)
         #2.) Note the location of all negative values
         for ii in range(len(uN_secHist2)):
             if uN_secHist2[ii] < 0:
