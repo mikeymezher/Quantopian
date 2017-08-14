@@ -11,17 +11,19 @@ from scipy import signal
 import itertools as itools
 from sklearn.preprocessing import MinMaxScaler
 from sklearn.preprocessing import StandardScaler
+from quantopian.pipeline.data.psychsignal import aggregated_twitter_withretweets_stocktwits as st
 
 
 def initialize(context):
     """
     Called once at the start of the algorithm.
     """   
+    
+    
+    
+    context.Sentiment_multiplier = 2 #Number of times more bull messages than bear messages a stock must have had to be acceptable for trading
     # Create our dynamic stock selector.
-    #Options as of now: tot(all), defense, tech, auto, chem
-    attach_pipeline(make_pipeline('tot'), 'my_pipeline')
-    
-    
+    attach_pipeline(make_pipeline(context), 'my_pipeline')
     context.minCorr=0.1 #Minimum acceptable cross correlation value to make trades based on
     context.lookback=180 #This is the number of minutes used during cross correlation of data. Note, that this should be less than 370 (390 trading day minutes - 20 min end of day stop) since we correlate same day data then trade based on those correlation. (Correlate first half the day, trade second half) 
     # *****^ Same day correlation may be the best way to figure out tau, but it may be suboptimal for selecting commonly correlated stocks. This selection is more likely to make errors in picking stocks which have a coincidentally high correlation (just for one particular day). 
@@ -39,7 +41,7 @@ def initialize(context):
 #**********************************************************************
     
     context.slope_lookback=20#Number of minutes used when determining sudden price change. 
-    context.perChange = .1 #Percent change over length of 1/3(context.slope_lookback) that would indicate a sudden price change (This is the percent change that trades will be made on)
+    context.perChange = .07 #Percent change over length of 1/3(context.slope_lookback) that would indicate a sudden price change (This is the percent change that trades will be made on) **May be best adjusted based on volatility***
     context.numTradeCombo=5 #Number of most correlated combinations we wish to keep.
     #TODO: lookback may be best adjusted daily, to account for long term change in ideal lookback time.
     context.timerList=[] #List of times of when to make a trade (unit in minutes from present)
@@ -49,7 +51,7 @@ def initialize(context):
     context.tempCash=0
     
     context.baseThresh=0 #Percent change used as a threshold for determining the time of the base of a spike. 
-    context.fallThresh=-.001 #Rate at which fall has to occur before an end of spike has been indicated (Usually 0)
+    context.fallThresh=-.0001 #Rate at which fall has to occur before an end of spike has been indicated (Usually 0)
     
     #Sell all securities at the end of each trading day (5 minutes before close of market)
     schedule_function(sellAll, date_rules.every_day(), time_rules.market_close(minutes=15))
@@ -65,7 +67,7 @@ def initialize(context):
     set_commission(commission.PerShare(cost=0.0, min_trade_cost=0.0))   
 
            
-def make_pipeline(pType):
+def make_pipeline(context):
     """
     A function to create our dynamic stock selector (pipeline). Documentation on
     pipeline can be found here: https://www.quantopian.com/help#pipeline-title
@@ -84,6 +86,11 @@ def make_pipeline(pType):
     # Note that these may need to be even further filtered to exclude securities outside of a 
     # similar range of volumes/size. For instance, the defense sector stock provides stocks as large as     # LMT but also small defense companies. Although this shouldn't matter due to the second filter of 
     # crosscorrelation, this may be unnecassary computational expense. 
+    pipe=Pipeline()
+    #Below forms a "sentiment screen" that takes only stocks that have been rated a certain number of times and of those ratings there are at least 2.85 times as many bull scored messages as there are bear scored messages. 
+    pipe.add(st.bull_scored_messages .latest, 'bull_scored_messages')
+    pipe.add(st.bear_scored_messages .latest, 'bear_scored_messages')
+    sentimentScreen=(((st.bull_scored_messages.latest) > (context.Sentiment_multiplier*st.bear_scored_messages.latest)) & (st.bear_scored_messages.latest > 5))
     
     dFilt=sector.eq(310) #Indicates aerospace/defense sector
     dFilt2=industry.eq(31052107) #Indicates aerospace/defense industry
@@ -93,26 +100,22 @@ def make_pipeline(pType):
     cFilt2=industry.eq(10103003)
     aFilt=sector.eq(102)
     aFilt2=industry.eq(10209017) #Auto manufacturing industry
-    defenseFilt= dFilt & dFilt2 #Combination of filters
+    defenseFilt= dFilt & dFilt2  #Combination of filters
     techFilt= tFilt & tFilt2
-    chemFilt = cFilt & cFilt2
-    autoFilt = aFilt & aFilt2
-    tradable=base_universe & (defenseFilt | techFilt | chemFilt | autoFilt)
+    chemFilt = cFilt & cFilt2 
+    autoFilt = aFilt & aFilt2  
+    tradable=base_universe & (defenseFilt | techFilt | chemFilt | autoFilt) & sentimentScreen
     
-    if pType =='tot':
-    	pipe = Pipeline(
-        	screen = tradable,
-        	columns = {}
-    	)
-        print('Type was tot')
-    if pType == 'defense':
-    	pipe=Pipeline(screen=defenseFilt & base_universe,columns={})
-    if pType == 'auto':
-    	pipe=Pipeline(screen=autoFilt & base_universe,columns={})
-    if pType == 'tech':
-    	pipe=Pipeline(screen=techFilt & base_universe,columns={})
-    if pType == 'chem':
-    	pipe=Pipeline(screen=chemFilt & base_universe,columns={})
+    
+    pipe.set_screen(tradable)
+    pipe.add(defenseFilt,'defenseFilt')
+    pipe.add(techFilt,'techFilt')
+    pipe.add(chemFilt,'chemFilt')
+    pipe.add(autoFilt,'autoFilt')
+        
+        
+    
+    #TODO: May also want to return stock sentiment data and further filter tuple couples by only accepting couples with sentiment data in a similar range (further attributing to the validity of the calculated cross-correlation)
   
     return pipe
 
@@ -123,7 +126,8 @@ def getIdealSec(context, data): #This replaced before_trading_start(context, dat
     """
     record(Leverage = 																					           context.account.leverage,pos=len(context.portfolio.positions))
     context.output = pipeline_output('my_pipeline')
-    
+    #print('Pipeout: ')
+    #print(context.output)
   
     # These are the securities that we are interested in trading each day.
     # Note: As it stands, the securities in this list are from two different industries (defense and
@@ -131,11 +135,24 @@ def getIdealSec(context, data): #This replaced before_trading_start(context, dat
     # two respective industries prior to cross correlating, leaving them in the same matrix/data set and 
     # cross correlating them gives us a way to 'check' that the crosscorrelation is valid, since               securities within the same industry should typically cross correlate to a higher degree than across industries. ***
     context.security_list = context.output.index 
+    context.defenseList = context.output[context.output['defenseFilt']].index.tolist()
+    #print(context.defenseList)
+    context.autoList = context.output[context.output['autoFilt']].index.tolist()
+    #print(context.autoList)
+    context.chemList = context.output[context.output['chemFilt']].index.tolist()
+    #print(context.chemList)
+    context.techList = context.output[context.output['techFilt']].index.tolist()
+    #print(context.techList)
+    
      # Within each sector, calculate the mean (and max, since we may choose only to trade the maximally        correlated securities regardless of industry) crosscorrelation between all combinations of stocks. 
     #This will only run every trading day to prevent computational expense. In that 
     #respect, performs identically to a pipeline add-on (but allows the use of "history") 
-    price_history = np.transpose(data.history(context.security_list, fields="price",                                         bar_count=context.lookback,frequency="1m"))
-    price_history=price_history.as_matrix()
+    #Try block here incase pipe returns no valid securities. 
+    try:
+    	price_history = np.transpose(data.history(context.security_list, fields="price",                                         bar_count=context.lookback,frequency="1m"))
+    	price_history=price_history.as_matrix()
+    except:
+        price_history=[[0],[0],[0]]
     #This returns three arrays, containing a filtered set of maximally cross correlated securities            within the last time range (given by context.lookback), their associated (and filtered) time delays      corresponding to their maximum correlation, and the degree of their correlation in the given time        frame. Essentially, since tau has already been filtered for, the degree of their correlation should      be used as a confidence feature to make predictions off of, and tau should be used to determine when to make purchases/sales. 
     
     #The best securities to trade using this algorithm (each day) are listed in the below lists ***
@@ -239,8 +256,14 @@ def crossCorr(securities,history,context):
         
         #Filter also by tau range, can't trade stocks based on no delay correlation, and if delay is too          high, correlation is likely coincidental. Also, correlation must be above minimum acceptable correlation
         #Also verify that all returned security pairs are within the same industry (discard pair that are in different industries. (Call this conditional same_Pipe)
-        same_Pipe=True #Note, this is meant to check if pairs are within the same industry. This could potentially be very useful to implement (problem is multiple pipes are not supported, so we need a way to check for security.industry())
-        #same_Pipe = ((s1 and s2 in context.defensePipe.index) or (s1 and s2 in context.autoPipe.index) or (s1 and s2 in context.chemPipe.index) or (s1 and s2 in context.techPipe.index))
+        s1 = securities[combinations[c][0]]
+        s2 = securities[combinations[c][1]]
+        #Note, this is meant to check if pairs are within the same sector and industry. 
+        same_Pipe = ((s1 in context.defenseList and s2 in context.defenseList) or (s1 in context.autoList and s2 in context.autoList) or (s1 in context.chemList and s2 in context.chemList) or (s1 in context.techList and s2 in context.techList))
+        
+        #If we wish to skip over the same_Pipe (same industry filter), simply mark it as true (uncomment below.)
+        #same_Pipe=True
+        
         if maxCorrVal>=highCorrVal and abs(tau)>0 and abs(tau)<15 and maxCorrVal>=context.minCorr and same_Pipe:
             #Note that these tuple pairs should be checked to ensure the stocks are from the same                    industry (if they aren't there's likely a higher chance the correlation is coincidental
             maxSecs.append((securities[combinations[c][0]],securities[combinations[c][1]]))
@@ -287,7 +310,7 @@ def spikeDetect(recentHist):
     #To determine this, this function simply calculates the percent change of the last X prices
     #Calculating the mean percent change below: (given as normalized 0-1 value ie .1=10% change)
     erRange=len(recentHist)//3 
-    erRange=2 #Allows for find base to search more extensive history range while still looking for very abrupt price change as a trigger
+    erRange=3#Allows for find base to search more extensive history range while still looking for very abrupt price change as a trigger
     midRange=erRange*2
     endRange=erRange*3
     #Er_perChange ("early percent change") is the percent change of the most recent third of the stock price. Mid_perChange ("Middle percent change") is the percent change of the middle third (second of three time "windows") of the stock price. And Base_perChange is the percent change of the last third. 
