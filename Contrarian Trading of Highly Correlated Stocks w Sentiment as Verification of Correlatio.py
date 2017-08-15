@@ -21,12 +21,15 @@ def initialize(context):
     
     
     
-    context.Sentiment_multiplier = 2 #Number of times more bull messages than bear messages a stock must have had to be acceptable for trading
+    context.Sentiment_multiplier = 1.7 #Number of times more bull messages than bear messages a stock must have had to be acceptable for trading
     # Create our dynamic stock selector.
     attach_pipeline(make_pipeline(context), 'my_pipeline')
-    context.minCorr=0.1 #Minimum acceptable cross correlation value to make trades based on
-    context.lookback=180 #This is the number of minutes used during cross correlation of data. Note, that this should be less than 370 (390 trading day minutes - 20 min end of day stop) since we correlate same day data then trade based on those correlation. (Correlate first half the day, trade second half) 
+    context.minCorr=0.2 #Minimum acceptable cross correlation value to make trades based on
+    context.minCorr_short=.5 #Min acceptable cross correlation value (for short term tau) 
+    
+    context.lookback=1800 #This is the number of minutes used during cross correlation of data. Note, that this should be less than 370 (390 trading day minutes - 20 min end of day stop) since we correlate same day data then trade based on those correlation. (Correlate first half the day, trade second half) 
     # *****^ Same day correlation may be the best way to figure out tau, but it may be suboptimal for selecting commonly correlated stocks. This selection is more likely to make errors in picking stocks which have a coincidentally high correlation (just for one particular day). 
+    context.shortTau=180
  
 #Note, it may be ideal to select a tau based on the correlation method described below (just using the early half of the day) and to select likely correlated stocks seperately using a longer lookback time. ***
 #**********TODO*********************************************************
@@ -50,7 +53,7 @@ def initialize(context):
     context.tradingNow=[] #List of whether or not a security pair is currently trading (abrupt change already detected (yes = 1 or no = 0)
     context.tempCash=0
     
-    context.baseThresh=0 #Percent change used as a threshold for determining the time of the base of a spike. 
+    context.baseThresh=0 #Percent change used as a threshold for determining the time of the base of a spike. Also used to verify the presence of an occuring spike on the lag stock prior to purchase  
     context.fallThresh=-.0001 #Rate at which fall has to occur before an end of spike has been indicated (Usually 0)
     
     #Sell all securities at the end of each trading day (5 minutes before close of market)
@@ -100,11 +103,13 @@ def make_pipeline(context):
     cFilt2=industry.eq(10103003)
     aFilt=sector.eq(102)
     aFilt2=industry.eq(10209017) #Auto manufacturing industry
+    depFilt2=industry.eq(10217034) #Department store industry
+    #dFilt2,tFilt2,cFilt2,aFilt2=True,True,True,True #Remove industry requirement
     defenseFilt= dFilt & dFilt2  #Combination of filters
     techFilt= tFilt & tFilt2
     chemFilt = cFilt & cFilt2 
     autoFilt = aFilt & aFilt2  
-    tradable=base_universe & (defenseFilt | techFilt | chemFilt | autoFilt) & sentimentScreen
+    tradable=base_universe & (defenseFilt | techFilt | chemFilt | autoFilt | depFilt2) & sentimentScreen
     
     
     pipe.set_screen(tradable)
@@ -112,6 +117,7 @@ def make_pipeline(context):
     pipe.add(techFilt,'techFilt')
     pipe.add(chemFilt,'chemFilt')
     pipe.add(autoFilt,'autoFilt')
+    pipe.add(depFilt2,'depFilt')
         
         
     
@@ -143,7 +149,7 @@ def getIdealSec(context, data): #This replaced before_trading_start(context, dat
     #print(context.chemList)
     context.techList = context.output[context.output['techFilt']].index.tolist()
     #print(context.techList)
-    
+    context.depList = context.output[context.output['depFilt']].index.tolist()
      # Within each sector, calculate the mean (and max, since we may choose only to trade the maximally        correlated securities regardless of industry) crosscorrelation between all combinations of stocks. 
     #This will only run every trading day to prevent computational expense. In that 
     #respect, performs identically to a pipeline add-on (but allows the use of "history") 
@@ -154,13 +160,17 @@ def getIdealSec(context, data): #This replaced before_trading_start(context, dat
     except:
         price_history=[[0],[0],[0]]
     #This returns three arrays, containing a filtered set of maximally cross correlated securities            within the last time range (given by context.lookback), their associated (and filtered) time delays      corresponding to their maximum correlation, and the degree of their correlation in the given time        frame. Essentially, since tau has already been filtered for, the degree of their correlation should      be used as a confidence feature to make predictions off of, and tau should be used to determine when to make purchases/sales. 
-    
+    #hCorrVals,maxSecs,timeDelays,short_timeDelays=crossCorr(context.security_list,price_history,context)
     #The best securities to trade using this algorithm (each day) are listed in the below lists ***
-    hCorrVals,maxSecs,timeDelays=crossCorr(context.security_list,price_history,context)
+    try:
+    	hCorrVals,maxSecs,timeDelays,short_timeDelays=crossCorr(context.security_list,price_history,context)   
+    except: 
+        print('Crosscorr Failed')
+        maxSecs,hCorrVals,timeDelays,short_timeDelays=[],[],[],[]
     #"Globalize" the returned information so that we can handle these commodities every minute. 
     context.Securities=maxSecs
     context.CorrVals=hCorrVals
-    context.timeDelays=timeDelays
+    context.timeDelays=short_timeDelays #************Used to be timeDelays, now however, we calculate a more recent tau
     context.actionList,context.timerList,context.tradeList,context.tradingNow=[0]*len(context.Securities),[0]*len(context.Securities),[0]*len(context.Securities),[0]*len(context.Securities) #list of zeros indicating that no stocks should currently be trading
     #(Note that all stocks should be sold at end of every tradinng day.) 
   
@@ -169,6 +179,8 @@ def getIdealSec(context, data): #This replaced before_trading_start(context, dat
 #In the same respect, it may also be beneficial to store the last logged time frame correlation results, and use those as additional features 
 #The premise of both of these additional potential features is that extended time will likely end up being weighted in a classifier or regressor to a lesser degree than more recent time correlation values.
 
+        
+
 def crossCorr(securities,history,context):
      highCorrVal=0 #Initialize some comparator values
      #Initialize empty lists to return.
@@ -176,6 +188,7 @@ def crossCorr(securities,history,context):
      highCorrArray=[]
      maxSecs=[]
      timeDelays=[] 
+     short_timeDelays=[]
      numSec=len(history) #Number of securities being evaluated
      combinations=list(itools.combinations(range(numSec),2)) #All possible combinations of securities
 
@@ -243,34 +256,40 @@ def crossCorr(securities,history,context):
         normScaler.fit(secHist2)
         secHist2=normScaler.transform(secHist2)
         
+        shortHist1=secHist1[-1:len(secHist1)-context.shortTau:-1] #Get more recent tau to make predictions based off of. 
+        shortHist2=secHist2[-1:len(secHist2)-context.shortTau:-1]
         corrVals=np.correlate(secHist1,secHist2,'same')
+        short_corrVals=np.correlate(shortHist1,shortHist2,'same')
         #Finally, we normalize the cross correlation such that it has a min value of -1 and a max of 1
         corrVals=corrVals/len(corrVals) 
         maxCorrVal=max(corrVals)
+        short_maxCorrVal=max(short_corrVals)
         #If the index max is small, the first security is leading (the smaller, the more lead)
         idxMax=np.argmax(corrVals) #Maximum correlation value index, will be used to calculate tau.
+        short_idxMax=np.argmax(short_corrVals)
         midPoint=context.lookback/2
+        short_midPoint=context.shortTau/2
         #Tau (the lag) is calculated below. If tau is negative, the second security leads
         #(The greater the magnitude, the more lag)
         tau=midPoint-idxMax #Tau is given in units of minutes of lag
-        
+        short_tau=short_midPoint-short_idxMax
         #Filter also by tau range, can't trade stocks based on no delay correlation, and if delay is too          high, correlation is likely coincidental. Also, correlation must be above minimum acceptable correlation
         #Also verify that all returned security pairs are within the same industry (discard pair that are in different industries. (Call this conditional same_Pipe)
         s1 = securities[combinations[c][0]]
         s2 = securities[combinations[c][1]]
         #Note, this is meant to check if pairs are within the same sector and industry. 
-        same_Pipe = ((s1 in context.defenseList and s2 in context.defenseList) or (s1 in context.autoList and s2 in context.autoList) or (s1 in context.chemList and s2 in context.chemList) or (s1 in context.techList and s2 in context.techList))
+        same_Pipe = ((s1 in context.defenseList and s2 in context.defenseList) or (s1 in context.autoList and s2 in context.autoList) or (s1 in context.chemList and s2 in context.chemList) or (s1 in context.techList and s2 in context.techList) or (s1 in context.depList and s2 in context.depList))
         
         #If we wish to skip over the same_Pipe (same industry filter), simply mark it as true (uncomment below.)
         #same_Pipe=True
         
-        if maxCorrVal>=highCorrVal and abs(tau)>0 and abs(tau)<15 and maxCorrVal>=context.minCorr and same_Pipe:
+        if maxCorrVal>=highCorrVal and abs(short_tau)>0 and abs(short_tau)<15 and maxCorrVal >= context.minCorr and short_maxCorrVal >= context.minCorr_short and same_Pipe:
             #Note that these tuple pairs should be checked to ensure the stocks are from the same                    industry (if they aren't there's likely a higher chance the correlation is coincidental
             maxSecs.append((securities[combinations[c][0]],securities[combinations[c][1]]))
             highCorrVals.append(maxCorrVal) #Will need to get index of maximum correlation values (tau)
             highCorrArray.append(corrVals) #New vals added to end of list
             timeDelays.append(tau)
-      
+            short_timeDelays.append(short_tau)
             #Values with a loweest degree of correlation are popped from the front of the list
             if len(highCorrVals)>context.numTradeCombo:
                 highCorrVal=min(highCorrVals)
@@ -279,11 +298,12 @@ def crossCorr(securities,history,context):
                 highCorrVals.pop(idxMin) 
                 highCorrArray.pop(idxMin)
                 timeDelays.pop(idxMin)
+                short_timeDelays.pop(idxMin)
      
      
      #Return a list of highly correlated securities (order matters here), a list of corresponding cross        correlation metrics and a list of corresponding time delays. 
     
-     return highCorrVals,maxSecs,timeDelays
+     return highCorrVals,maxSecs,timeDelays,short_timeDelays
     
     #TODO: Calculate tau for each tuple pair
     #      Identify securities with a high correlation in multiple instances, especially if they have 
@@ -340,17 +360,14 @@ def findBase(recentHist,changeThreshold):
     pass
 #Once the timer has come to 0 (assumed lag time has been met) make a trade - ie buy or sell the security
 #Note, that trades are always made on the LAGGING securities. 
-def makeTrade(data,context,idx):
+def makeTrade(data,context,idx,verified):
     openOrders=get_open_orders()
     if data.can_trade(context.tradeList[idx]):
         print('Trade based on: ' + str(context.Securities[idx]) + ' ' + str(context.CorrVals[idx]) + ' ' + str(context.timeDelays[idx]))
-        print('Action list: ')
-        print(context.actionList) 
-        print('Active list: ')
-        print(context.tradingNow)
-        print('Index: ' + str(idx))
+        print('Action list: ' + str(context.actionList) + ' Active list: ' + str(context.tradingNow) + ' Index: ' + str(idx))
+        
         #Sell all of the indicated security
-        if context.actionList[idx]==-1 and context.tradeList[idx] in context.portfolio.positions:
+        if context.actionList[idx]==-1: #and context.tradeList[idx] in context.portfolio.positions:
             order_target_percent(context.tradeList[idx],0)
             context.tradingNow[idx]=0 
             context.actionList[idx]=0
@@ -358,20 +375,30 @@ def makeTrade(data,context,idx):
             print('Sold ' + str(context.tradeList[idx]))
             
         #Buy a portion of the security proportional to the security's presence in the security list (the percent of portfolio in this increase every time this security is purchased (in contrast to order_target_percent)
-        print('temp cash ' + str(context.tempCash))
-        print('value of purchase: ' + str(context.portfolio.portfolio_value*float(1/(2*float(context.numTradeCombo)))))
-        if (context.actionList[idx]==1 and (context.tempCash >(context.portfolio.portfolio_value*float(1/(2*float(context.numTradeCombo))))) and context.tradeList[idx] not in openOrders and (context.portfolio.portfolio_value>0)): #and (len(openOrders)==0)):         			
+        
+        if (context.actionList[idx]==1 and (context.tempCash >(context.portfolio.portfolio_value*float(1/(2*float(context.numTradeCombo))))) and context.tradeList[idx] not in openOrders and (context.portfolio.portfolio_value>0) and verified): #and (len(openOrders)==0)):         			
             order_value(context.tradeList[idx],context.portfolio.portfolio_value*float(1/(2*float(context.numTradeCombo))))
             #If purchase is not made for one of the above reasons (if conditionals), then indicate that this correlated couple is not trading. 
             context.timerList[idx]=9999999 #Reset to high value to prevent repeat buying
             print('Purchased ' + str(context.tradeList[idx]))
             context.tempCash-=context.portfolio.portfolio_value*float(1/(2*float(context.numTradeCombo)))
+            print('value of purchase: ' + str(context.portfolio.portfolio_value*float(1/(2*float(context.numTradeCombo)))))
         else:
             #context.tradingNow[idx]=0
             print('Num open orders: ' + str(len(openOrders)))
         
     pass
      
+#This function is meant to verify the predicted spike IS occuring on the lagging stock prior to purchasing at the perceived base.
+def verifySpike(recentHist,context): 
+    lookback_range=1 #Minutes to calculate change of slope. (1 default)
+    RecentSlope=(recentHist[-1]-recentHist[-(1+lookback_range)])/(recentHist[-(1+lookback_range)])
+    if RecentSlope>context.baseThresh:
+        return True
+    else:
+        return False
+    pass
+
 def coordTrade(context,data):
     """
     Called every minute.
@@ -391,9 +418,11 @@ def coordTrade(context,data):
         if tau>0: 
             lead=pH1 
             lag=1
+            lag_hist=pH2
         if tau<0:
             lead=pH2 
             lag=0
+            lag_hist=pH1
             
         erSpike,midSpike,baseSpike,totSpike=spikeDetect(lead)
         #NEW SPIKE DETECTION AND TRADE COORDINATION METHOD:
@@ -403,6 +432,8 @@ def coordTrade(context,data):
 
 #This lets us retain the ability to acutely detect only fairly dramatic spikes, while also providing a way to detect where the spike initially occured (rather than find it only after its slope has significantly increased, where it may be ending shortly).
 
+
+    
 #TODO: New methods of initial spike detection (detect more gradual rises as well (use totSpike?)
         if erSpike>(context.perChange/100) and context.tradingNow[idx] == 0:
                 #Trade correlated stock in tau minutes. Mark that this security pair has been identified as tradable    
@@ -435,7 +466,10 @@ def coordTrade(context,data):
                 context.timerList[idx]=context.timerList[idx]-1 #Subtract 1 from the trade countdown timer
                 #If the timer is -1, it is time to make the trade. 
                 if context.timerList[idx]<=-1 and context.actionList[idx]!=0:
-                    makeTrade(data,context,idx) #Calling this function makes the a trade (buy or sell) Note that this function also resets the actionList of any given index (sets it to default value 0 after making a buy (1) or sell (-1)
+                    verified=False
+                    if context.actionList[idx]==1:
+                        verified=verifySpike(lag_hist,context)
+                    makeTrade(data,context,idx,verified) #Calling this function makes the a trade (buy or sell) Note that this function also resets the actionList of any given index (sets it to default value 0 after making a buy (1) or sell (-1)
                     context.actionList[idx]=0 #Note, that since we prevent the algorithm from buying additional stocks while there are open orders, having the action list reset to 0 here will prevent a backlogged spike train from ever trading.
                     	
 #Reset the stock's trading status only once the stock has been sold
